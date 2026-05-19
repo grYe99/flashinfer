@@ -91,6 +91,11 @@ class AllReduceFusionPattern:
     kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8
     # Same as kARResidualRMSNormPerTokenGroupFP8PackedQuant, with norm output
     kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9
+    # All-reduce followed by residual add, RMS norm and per-token FP8 quantization
+    # with UE8M0 packed scales
+    kARResidualRMSNormPerTokenFP8PackedQuant = 10
+    # Same as kARResidualRMSNormPerTokenGroupFP8PackedQuant, with norm output
+    kARResidualRMSNormOutPerTokenFP8PackedQuant = 11
 
 
 class QuantizationSFLayout:

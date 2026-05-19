@@ -518,6 +518,8 @@ def allreduce_fusion(
                  - kMoEFinalizeARResidualRMSNorm = 7 (trtllm only)
                  - kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8 (trtllm only)
                  - kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9 (trtllm only)
+                 - kARResidualRMSNormPerTokenFP8PackedQuant = 10 (trtllm only)
+                 - kARResidualRMSNormOutPerTokenFP8PackedQuant = 11 (trtllm only)
                  Note: MNNVL only supports patterns 0 and 1
                  Note: MOE patterns (6-7) only support trtllm backend
         launch_with_pdl: Use Programmatic Dependent Launch
@@ -775,6 +777,25 @@ def allreduce_fusion(
             if scale_out.stride() != expected_stride:
                 raise ValueError(
                     f"scale_out stride must be {expected_stride}, got {scale_out.stride()}"
+                )
+            if scale_out.dtype != torch.int32:
+                raise ValueError(
+                    f"scale_out dtype must be torch.int32, got {scale_out.dtype}"
+                )
+        
+        if pattern in [
+            AllReduceFusionPattern.kARResidualRMSNormPerTokenFP8PackedQuant,
+            AllReduceFusionPattern.kARResidualRMSNormOutPerTokenFP8PackedQuant,
+        ]:
+            if scale_out is None:
+                raise ValueError(f"scale_out is required for pattern: {pattern}")
+
+            token_num, hidden_dim = input.shape
+            expected_shape = (token_num, )
+
+            if scale_out.shape != expected_shape:
+                raise ValueError(
+                    f"scale_out shape must be {expected_shape}, got {tuple(scale_out.shape)}"
                 )
             if scale_out.dtype != torch.int32:
                 raise ValueError(

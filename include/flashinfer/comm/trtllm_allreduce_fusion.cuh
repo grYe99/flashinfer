@@ -17,6 +17,8 @@
 #include "../utils.cuh"
 #include "../vec_dtypes.cuh"
 
+#include "flashinfer/trtllm/common/reduceKernelUtils.cuh"
+
 namespace flashinfer {
 
 namespace trtllm_allreduce_fusion {
@@ -730,6 +732,10 @@ enum class AllReduceFusionPattern : int {
   kARResidualRMSNormPerTokenGroupFP8PackedQuant = 8,
   // Same as above but also outputs the norm result
   kARResidualRMSNormOutPerTokenGroupFP8PackedQuant = 9,
+  // Per-token FP8 quantization with UE8M0 packed scales
+  kARResidualRMSNormPerTokenFP8PackedQuant = 10,
+  // Same as above but also outputs the norm result
+  kARResidualRMSNormOutPerTokenFP8PackedQuant = 11,
 };
 
 enum class QuantType : int {
@@ -737,6 +743,7 @@ enum class QuantType : int {
   kFP8 = 1,
   kFP4 = 2,
   kPerTokenGroupFP8Packed = 3,  // Per-token-group FP8 with dynamic UE8M0 scales
+  kPerTokenFP8Packed = 4,  // Per-token-group FP8 with dynamic UE8M0 scales
 };
 
 template <AllReduceFusionPattern Pattern>
@@ -771,6 +778,11 @@ DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormPerTokenG
 DEFINE_FUSION_PATTERN_TRAITS(
     AllReduceFusionPattern::kARResidualRMSNormOutPerTokenGroupFP8PackedQuant, false, true, true,
     true, true, QuantType::kPerTokenGroupFP8Packed);
+DEFINE_FUSION_PATTERN_TRAITS(AllReduceFusionPattern::kARResidualRMSNormPerTokenFP8PackedQuant,
+                             false, true, true, true, false, QuantType::kPerTokenFP8Packed);
+DEFINE_FUSION_PATTERN_TRAITS(
+    AllReduceFusionPattern::kARResidualRMSNormOutPerTokenFP8PackedQuant, false, true, true,
+    true, true, QuantType::kPerTokenFP8Packed);
 #undef DEFINE_FUSION_PATTERN_TRAITS
 
 template <AllReduceFusionPattern Pattern>
@@ -1139,6 +1151,55 @@ class FusedOp {
           write_group_scale(group_idx_in_row, group_absmax);
         }
       }
+    } else if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenFP8Packed) {
+      // Per-token FP8 quantization with UE8M0 packed scales.
+      constexpr float FP8_E4M3_MAX = 448.0f;
+
+      // Compute local absmax for this thread's elements
+      float local_absmax = 0.0f;
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        float v = fabsf(static_cast<float>(reinterpret_cast<T*>(&val)[i]));
+        local_absmax = fmaxf(local_absmax, v);
+      }
+
+      // Get block absmax
+      local_absmax = blockAllReduceMax(local_absmax);
+
+      // compute UE8M0 scale
+      auto compute_ue8m0_scale = [](float token_absmax) -> float {
+        float y_s = fmaxf(token_absmax / FP8_E4M3_MAX, 1e-10f);
+        unsigned int y_s_bits = __float_as_uint(y_s);
+        if (y_s_bits & 0x7fffff) {
+          y_s_bits = (y_s_bits + 0x800000) & 0x7f800000;
+        }
+        return __uint_as_float(y_s_bits);
+      };
+
+      float y_s = compute_ue8m0_scale(local_absmax);
+      unsigned int bits = __float_as_uint(y_s);
+      uint8_t exponent = static_cast<uint8_t>((bits >> 23u) & 0xffu);
+      
+      // Only thread 0 in the block writes the scale for this token
+      if (tid == 0) {
+        // Write exponent (8-bit) to scale_out[token_id]
+        reinterpret_cast<uint8_t*>(m_params.scale_out)[token_id] = exponent;
+      }
+
+      // Get scale from smem_exponent for quantization
+      unsigned int scale_bits = exponent;
+      float scale = __uint_as_float((scale_bits & 0xffu) << 23u);
+
+      // Quantize using the scale
+      using PackedQuantizedType = std::conditional_t<std::is_same_v<T, float>, float, float2>;
+      PackedQuantizedType ret;
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        float q = static_cast<float>(reinterpret_cast<T*>(&val)[i]) / scale;
+        q = fminf(fmaxf(q, -FP8_E4M3_MAX), FP8_E4M3_MAX);
+        reinterpret_cast<__nv_fp8_e4m3*>(&ret)[i] = static_cast<__nv_fp8_e4m3>(q);
+      }
+      reinterpret_cast<PackedQuantizedType*>(m_params.quant_out)[m_access_id] = ret;
     } else {
       static_assert(GetQuantType<Pattern> == QuantType::kNone, "Invalid quant type");
     }
@@ -1648,6 +1709,14 @@ cudaError_t allreduce_fusion_kernel_launcher(AllReduceFusionParams<T> const& par
                      "a multiple of block_quant_group_size");
   }
 
+  if constexpr (GetQuantType<Pattern> == QuantType::kPerTokenFP8Packed) {
+    // Per-token: each block handles one token, threads cover entire hidden_dim
+    // Use block_size = threads_per_token, cluster_size = 1
+    threads_per_block = threads_per_token;
+    block_size = threads_per_block;
+    cluster_size = 1;
+  }
+
   // Check conditions using the final block_size (not threads_per_block)
   FLASHINFER_CHECK(oneshot || block_size >= params.nranks, "not oneshot, or block_size < nranks");
   FLASHINFER_CHECK(block_size <= 1024 && cluster_size > 0,
@@ -1739,6 +1808,14 @@ cudaError_t allreduce_fusion_op(AllReduceFusionParams<T> const& params, bool lau
     case AllReduceFusionPattern::kARResidualRMSNormOutPerTokenGroupFP8PackedQuant:                \
       DISPATCH_ACC_TYPE(                                                                          \
           T, AllReduceFusionPattern::kARResidualRMSNormOutPerTokenGroupFP8PackedQuant, NRanks);   \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormPerTokenFP8PackedQuant:                         \
+      DISPATCH_ACC_TYPE(T, AllReduceFusionPattern::kARResidualRMSNormPerTokenFP8PackedQuant,     \
+                        NRanks);                                                                  \
+      break;                                                                                      \
+    case AllReduceFusionPattern::kARResidualRMSNormOutPerTokenFP8PackedQuant:                    \
+      DISPATCH_ACC_TYPE(                                                                          \
+          T, AllReduceFusionPattern::kARResidualRMSNormOutPerTokenFP8PackedQuant, NRanks);         \
       break;                                                                                      \
     default:                                                                                      \
       FLASHINFER_CHECK(false, "Unsupported allreduce fusion pattern");                            \
